@@ -3,8 +3,7 @@ var p2 = require('p2');
 var http = require('http').Server(app);
 var io = require('socket.io')(http);
 var player;
-var players = {'players':[]};
-var playerList = [];
+var players = [];
 var forwarded = require('forwarded-for');
 var UUID = require('node-uuid');
 var bombs = [];
@@ -21,37 +20,42 @@ io.on('connection', function(socket){
 
     player = {
         id : UUID(),
-	x : 10,
-	y : 20
+        color : (Math.random()*0xFFFFFF<<0).toString(16),
     };
 
-    playerList[player.id] = new Player(player.id);
-    players[player.id] = player;
+    players[player.id] = new Player(player.id);
+    players[player.id].color = player.color;
+
+    var connectedPlayers = [];
+    for(var i in players) {
+        connectedPlayers.push({
+	    id: players[i].pid,
+	    color: players[i].color,
+	});
+    }
+
+    socket.emit('onconnected',{pid: player.id, list: connectedPlayers});
+    socket.broadcast.emit('newconnected', player);
+
 
     var ts = new Date().toString().split(' ').splice(1,4).join('/') + (" - ");
-
     var req = socket.request;
     var ip = forwarded(req, req.headers);
-    var pid = player.id;
-
     console.log(ts + player.id + " connected from ip: " + ip.ip);
 
-    socket.emit('onconnected',{pid: pid, list: players});
-    socket.broadcast.emit('newconnected', pid);
-
-
     socket.on('move', function(input) {
-        if(playerList[input.pid] != null)
-	    playerList[input.pid].processInputs(input);
+        if(players[input.pid] != null)
+	    players[input.pid].processInputs(input);
     });
 
     socket.on('disconnect', function() {
-        console.log(ts + pid + " disconnected");
-        io.emit('dc', pid);	
-	world.removeBody(playerList[pid].body);
+        console.log(ts + player.id + " disconnected");
+        io.emit('dc', player.id);	
 
-        if(players[pid] != null)
-            delete players[pid];
+        if(players[player.id] != null) {
+	    world.removeBody(players[player.id].body);
+            delete players[player.id];
+	}
     });
 });
 
@@ -62,7 +66,10 @@ var mvspd = 4;
 var jumpforce = 8;
 var lastProcessedInput;
 var isDead;
+var ableToFire;
 var ttl;
+var timer;
+var kills, deaths, color;
 
 var Bomb = function(pos) {
     var circle = new p2.Circle(size/2);
@@ -83,11 +90,19 @@ var Bomb = function(pos) {
 };
 
 Bomb.prototype.destroy = function (id) {
-    world.removeBody(bombs[id].body);
+    var pos = this.body.position;
+
+    world.removeBody(this.body);
 
     if(bombs[id] != null)
         delete bombs[id];
 
+    var source = {
+        pos : this.body.position,
+	id : id,
+    };
+
+    explosionRadiusCheck(source);
     io.emit('exploded', id);	
 };
 
@@ -95,6 +110,11 @@ var Player = function(id) {
     var rectangle= new p2.Rectangle(size,size);
     this.pid = id; 
     this.isDead = false;
+    this.ableToFire = true;
+    this.timer = 0;
+    this.kills = 0;
+    this.deaths = 0;
+    this.color = '0x#FFFFFF';
   
     var opts = { 
         mass: 1,
@@ -112,26 +132,30 @@ var Player = function(id) {
 
 Player.prototype.processInputs = function(input) {
     var id = input.pid;
-        if(this.isDead && input.respawn)
-	    this.respawn();
+    if(this.isDead && input.respawn)
+        this.respawn();
 
-        if(!this.isDead) {
-            if(input.up && checkIfCanJump(this.body))
-	        this.body.velocity[1] = jumpforce;
+    if(!this.isDead) {
+        if(input.up && checkIfCanJump(this.body))
+            this.body.velocity[1] = jumpforce;
         
-            if(input.fire && bombs[this.pid] == null)
-	        this.fire();
+        if(input.fire && bombs[this.pid] == null && this.ableToFire)
+	    this.fire();
+        else if(bombs[this.pid] != null && !this.ableToFire && input.fire && bombs[this.pid].ttl <= 2.5)
+	    bombs[this.pid].destroy(this.pid);
 
-            if(input.right)
-	        this.body.velocity[0] = mvspd;
-            else if(input.left)
-	        this.body.velocity[0] = -mvspd;
+        if(input.right)
+	    this.body.velocity[0] = mvspd;
+        else if(input.left)
+	    this.body.velocity[0] = -mvspd;
 
-	this.lastProcessedInput[id] = input.seqNumber;
-	}
+        this.lastProcessedInput[id] = input.seqNumber;
+    }
 };
 
 Player.prototype.fire = function () {
+    this.ableToFire = false;
+
     var pos = {
         x: this.body.position[0],
         y: this.body.position[1],
@@ -145,15 +169,19 @@ Player.prototype.fire = function () {
         bomb: {x: bombs[this.pid].body.position[0], y: bombs[this.pid].body.position[1]},
     };
 
-    //console.log(data);
     io.emit('fired', data);	
 };
 
-Player.prototype.destroy = function () {
-    var data = this.pid;
-    io.emit('destroyed', data);	
+Player.prototype.destroy = function (destroyerId) {
+    var data = {
+    	id : this.pid,
+	destroyerId : destroyerId,
+    };
+
     this.isDead = true;
-    world.removeBody(playerList[this.pid].body);
+    this.deaths++;
+    world.removeBody(players[this.pid].body);
+    io.emit('destroyed', data);	
 };
 
 Player.prototype.respawn = function () {
@@ -165,6 +193,15 @@ Player.prototype.respawn = function () {
     io.emit('respawned', data);	
 };
 
+Player.prototype.fireTimeout = function (delta) {
+    if(!this.ableToFire)
+        this.timer += delta; 
+
+    if(this.timer >= 3) {
+        this.ableToFire = true;
+        this.timer = 0;
+    }
+};
 var Platform = function(sizeX, sizeY, posX, posY) {
     var rectangle = new p2.Rectangle(sizeX, sizeY);
     this.body = new p2.Body({
@@ -182,21 +219,14 @@ var Platform = function(sizeX, sizeY, posX, posY) {
 world.islandSplit = true;
 world.sleepMode = p2.World.ISLAND_SLEEPING;
 world.solver.iterations = 20;
-world.solver.tolerance = 0.001;
+world.solver.tolerance = 0.0001;
 //world.setGlobalStiffness(1e4);
 world.defaultContactMaterial.friction = 1;
 world.defaultContactMaterial.restitution = 0.6;
 
 var plane = null;
-var plat1 = null;
-var plat2 = null;
-var plat3 = null;
-var plat4 = null;
-var plat5 = null;
-var plat6 = null;
-var plat7 = null;
-var plat8 = null;
-var plat9 = null;
+var plat = null;
+var roof = null;
 var wall1 = null;
 var wall2 = null;
 
@@ -209,17 +239,24 @@ var plane = new p2.Body({
 plane.addShape(planeShape);
 world.addBody(plane);
 
-plat1 = new Platform(3, 0.1, -4, -0.5);
-plat2 = new Platform(3, 0.1, 4, -0.5);
-plat3 = new Platform(3, 0.1, -4, 1);
-plat4 = new Platform(3, 0.1, 4, 1);
-plat5 = new Platform(1.5, 0.1, -4, 2);
-plat6 = new Platform(1.5, 0.1, 4, 2);
-plat7 = new Platform(3, 0.1, 0, 0);
-plat8 = new Platform(1, 0.1, 1.7, 0.5);
-plat9 = new Platform(2, 0.1, -0.3, 1);
-wall1 = new Platform(1, 15, -5, -1);
-wall2 = new Platform(1, 15, 5, -1);
+plat = new Platform(3, 0.1, -4, -0.5);
+plat = new Platform(3, 0.1, 4, -0.5);
+plat = new Platform(3, 0.5, -4, 1);
+plat = new Platform(3, 0.5, 4, 1);
+plat = new Platform(1.5, 0.1, -4, 2);
+plat = new Platform(0.5, 1, -4, 2.5);
+plat = new Platform(1.5, 0.1, 4, 2);
+plat = new Platform(0.5, 1, 4, 2.5);
+plat = new Platform(3, 0.5, 0, 0);
+plat = new Platform(1, 0.5, 1.5, 0.5);
+plat = new Platform(1, 0.5, -7, 0.25);
+plat = new Platform(1, 0.5, 7, 0.25);
+plat = new Platform(1.5, 0.1, -0.5, 1);
+plat = new Platform(0.5, 1, 0, 1.5);
+roof = new Platform(16, 1, 0, 5);
+
+wall1 = new Platform(1, 25, -8, -1);
+wall2 = new Platform(1, 25, 8, -1);
 
 http.listen(5000, function(){
     console.log('listening on *:5000');
@@ -227,32 +264,35 @@ http.listen(5000, function(){
 
 var sendStateToClients =  function() {
     var state = [];
-    for(var i in playerList) {
-        var p = playerList[i];
+    var timeStamp = Date.now();
+    for(var i in players) {
+        var p = players[i];
         var bomb;
         if(bombs[p.pid] != null)
             bomb = {x: bombs[p.pid].body.position[0], y: bombs[p.pid].body.position[1]};
 
-        state.push({id: p.pid,
-		    position: {x: p.body.position[0], y: p.body.position[1]},
-		    bomb: bomb,
-		    lastProcessedInput: p.lastProcessedInput[p.pid],
-		   });
+        state.push({
+	    id: p.pid,
+	    position: {x: p.body.position[0], y: p.body.position[1], vel: p.body.velocity},
+	    bomb: bomb,
+	    lastUpdate: timeStamp,
+	    lastProcessedInput: p.lastProcessedInput[p.pid],
+	    kills: p.kills,
+	    deaths: p.deaths,
+	});
     }
     io.emit('moved', state);	
 };
 
-var physicsTimeStep = 1 / 45; // seconds 
-var stateTimeStep = 1 / 30;
-//gameloop
-setInterval(function(){
-    updateBombs(physicsTimeStep);
-    world.step(physicsTimeStep);
-}, 1000 * physicsTimeStep);
+var timeStep = 1 / 64; 
 
 setInterval(function(){
+    world.step(timeStep);
+    updateBombs(timeStep);
+    updatePlayerBombTimeout(timeStep);
     sendStateToClients();
-}, 1000 * stateTimeStep);
+}, 1000 * timeStep);
+
 
 var yAxis = p2.vec2.fromValues(0,1);
   
@@ -269,29 +309,46 @@ function checkIfCanJump(playerbody){
     return result;
 }
 
+function updatePlayerBombTimeout(delta) {
+    for(var i in players)
+        players[i].fireTimeout(delta);
+}
+
 function updateBombs(delta) {
     for(var i in bombs) {
         if(bombs[i].ttl <= 0) {
-	    explosionRadiusCheck(bombs[i].body.position);
 	    bombs[i].destroy(i);
 	} else
             bombs[i].ttl -= delta;
     }
 }
 
-function explosionRadiusCheck(pos) {
-    var bombX = pos[0]; 
-    var bombY = pos[1];
+function explosionRadiusCheck(source) {
+    var bombX = source.pos[0]; 
+    var bombY = source.pos[1];
     var explosionRadius = 1.5;
 
-    for(var i in playerList) {
-        var playerX = playerList[i].body.position[0];
-        var playerY = playerList[i].body.position[1];
+    for(var i in players) {
+        var playerX = players[i].body.position[0];
+        var playerY = players[i].body.position[1];
 	
 	if(playerX > bombX - explosionRadius && playerX < bombX + explosionRadius) {
-	    if(playerY > bombY - explosionRadius && playerY < bombY + explosionRadius) {
-	       playerList[i].destroy();
+	    if(playerY > bombY - explosionRadius && playerY < bombY + explosionRadius && !players[i].isDead) {
+	       players[i].destroy(source.id);
+	       if(players[source.id] != null)
+	           players[source.id].kills++;
             }
 	}
+
+	if(bombs[i] != null) {
+            var otherBombX = bombs[i].body.position[0];
+            var otherBombY = bombs[i].body.position[1];
+
+	    if(otherBombX > bombX - explosionRadius && otherBombX < bombX + explosionRadius) {
+	        if(otherBombY > bombY - explosionRadius && otherBombY < bombY + explosionRadius) {
+	            bombs[i].destroy(i);
+                }
+	    }
+        }
     }
 }

@@ -1,17 +1,18 @@
 var renderer, stage, container, graphics;
-var zoom = 65;
-var p;
+var gameSize = 128;
+//var zoom = window.innerHeight / (window.innerWidth / gameSize);
+var zoom = 80;
 var myid;
 var socket;
 var player;
 var players = [];
 var bombs = [];
 var particles = [];
+var textLogs = [];
 var mvspd = 4;
 var jumpforce = 8;
-var ground, plat1, plat2, plat3, plat4, plat5, plat6, plat7, plat8, plat9, wall1, wall2;
-var size = 0.23,
-    dist = size * 2;
+var ground, wall1, wall2;
+var size = 0.23;
 
 var buttons = {
     up : false,
@@ -29,6 +30,8 @@ var seqNumber;
 var pendingInputs;
 var world;
 var isDead;
+var kills;
+var deaths;
 
 var myPlayer;
 var plane = null;
@@ -48,9 +51,8 @@ var Particles = function(x, y, vel, col, ttl) {
         position: [0, y],
         velocity: [vel.x , vel.y],
     });
+
     this.body.addShape(particle);
-    //this.body.allowSleep = false;
-    //this.body.type = p2.Body.AWAKE;
     this.body.damping = 0;
     world.addBody(this.body);
 
@@ -64,8 +66,8 @@ Particles.prototype.destroy = function (id) {
     world.removeBody(this.body);
     container.removeChild(this.graphics);
     particles.slice(id, 1);
-
 };
+
 var Ground = function() {
     var planeShape = new p2.Plane();
     var plane = new p2.Body({
@@ -94,8 +96,7 @@ var Platform = function(sizeX, sizeY, posX, posY) {
 
     this.graphics = new PIXI.Graphics();
     this.graphics.beginFill(0xFFFFFF);
-    //this.graphics.drawRect(posX, posY, rectangle.width, rectangle.height);
-    this.graphics.drawRect(posX - sizeX/2, posY, rectangle.width, rectangle.height);
+    this.graphics.drawRect(posX - sizeX/2, posY - sizeY/2, rectangle.width, rectangle.height);
     container.addChild(this.graphics);
 };
 
@@ -124,26 +125,32 @@ var Bomb = function(pos) {
 };
 
 Bomb.prototype.destroy = function(id) {
-            world.removeBody(this.body);
-	    container.removeChild(this.graphics);
-            bombs.splice(id, 1);
+    world.removeBody(this.body);
+    container.removeChild(this.graphics);
+    bombs.splice(id, 1);
 };
 
-var Player = function(id) {
+var color;
+var Player = function(id, col) {
     console.log("CREATED ANOTHER PLAYER");
     var rectangle= new p2.Rectangle(size,size);
     this.pid = id;
     this.isDead = false;
+    this.color = col;
+    this.kills = 0;
+    this.deaths = 0;
+    this.lerpPercentage = 0;
 
     var opts = {
 	mass: 1,
-	position: [0,1],
+	position: [0,-0.5],
+	//type: p2.Body.STATIC,
     };
 
     this.seqNumber = 0;
     this.pendingInputs = [];
-    this.curState = {pos:{x:0,y:0}};
-    this.oldState = {pos:{x:0,y:0}};
+    this.curState = {x:0,y:0, vel:{x: 0, y:0}, lastUpdate: Date.now()};
+    this.oldState = {x:0,y:0, vel:{x: 0, y: 0}, lastUpdate: Date.now()};
 
     this.body = new p2.Body(opts);
     this.body.addShape(rectangle);
@@ -152,7 +159,7 @@ var Player = function(id) {
     world.addBody(this.body);
 
     this.graphics = new PIXI.Graphics();
-    this.graphics.beginFill(0xff5555);
+    this.graphics.beginFill("0x" + col);
     this.graphics.drawRect(-rectangle.width/2, -rectangle.height/2, rectangle.width, rectangle.height);
     container.addChild(this.graphics);
 };
@@ -182,11 +189,16 @@ Player.prototype.processInputs = function() {
     if(this.isDead && buttons.respawn)
         input.respawn = true;
 
-    input.seqNumber = this.seqNumber++;
-    input.pid = this.pid;
-    socket.emit('move', input);
-    this.applyInput(input);
-    this.pendingInputs.push(input);
+    for(i in input) {
+        if(input[i])
+	{
+            input.seqNumber = this.seqNumber++;
+            input.pid = this.pid;
+            socket.emit('move', input);
+            this.applyInput(input);
+            this.pendingInputs.push(input);
+        } 
+    }
 };
 
 Player.prototype.applyInput = function(input) {
@@ -213,6 +225,31 @@ Player.prototype.destroy = function() {
     this.isDead = true;
 };
 
+var now; 
+var lerpPercentage;
+Player.prototype.applyState = function(state) {
+    this.kills = state.kills;
+    this.deaths = state.deaths;
+
+
+    this.curState.x = state.position.x;
+    this.curState.y = state.position.y;
+    this.curState.lastUpdate = state.lastUpdate;
+
+    //console.log("now: " + now);
+    //console.log("portion: " + portion);
+    //console.log("total: " + total);
+    //console.log("ratio: " +ratio);
+
+
+    this.oldState.lastUpdate = Date.now();
+    this.oldState.x = this.curState.x;
+    this.oldState.y = this.curState.y;
+
+    //this.body.position[0] = this.curState.x;
+    //this.body.position[1] = this.curState.y;
+};
+
 
 Player.prototype.fire = function() {
     var pos = {
@@ -237,8 +274,7 @@ function init(){
     world.islandSplit = true;
     world.sleepMode = p2.World.ISLAND_SLEEPING;
     world.solver.iterations = 20;
-    world.solver.tolerance = 0.001;
-    //world.setGlobalStiffness(1e4);
+    world.solver.tolerance = 0.0001;
     world.defaultContactMaterial.friction = 1;
     world.defaultContactMaterial.restitution = 0.6;
 
@@ -265,48 +301,50 @@ function init(){
     container.scale.y = -zoom;
 }
 
-function sendMovement() {
-    var data = {
-	inputs: buttons,
-	id: myid
-    };
-}
-
 function onConnected() {
     socket.on('onconnected', function(pid, list) {
         myid = pid.pid;
-        console.log("CONNECTED");
-        console.log("ID: " + myid);
 
         for(var i in pid.list) {
             var n = pid.list[i];
 	    if(n.id != null) {
-	        players[n.id] = new Player(n.id);
+	        players[n.id] = new Player(n.id, n.color);
 
 		if(myid === n.id) {
 		    myPlayer = players[n.id];
-                    ground = new Ground();
-		    plat1 = new Platform(3, 0.1, -4, -0.5);
-		    plat2 = new Platform(3, 0.1, 4, -0.5);
-		    plat3 = new Platform(3, 0.1, -4, 1);
-		    plat4 = new Platform(3, 0.1, 4, 1);
-		    plat5 = new Platform(1.5, 0.1, -4, 2);
-		    plat6 = new Platform(1.5, 0.1, 4, 2);
-		    plat7 = new Platform(3, 0.1, 0, 0);
-		    plat8 = new Platform(1, 0.1, 1.7, 0.5);
-		    plat9 = new Platform(2, 0.1, -0.3, 1);
-		    wall1 = new Platform(1, 15, -5, -1);
-		    wall2 = new Platform(1, 15, 5, -1);
-	        }
+                    drawText(n.color, "#000000", n.id,"CONNECTED", "");
+           	}
 	    }
-        }
+        }          
+	    ground = new Ground();
+	    var plat;
+	    var roof;
+	    plat = new Platform(3, 0.1, -4, -0.5);
+	    plat = new Platform(3, 0.1, 4, -0.5);
+	    plat = new Platform(3, 0.5, -4, 1);
+	    plat = new Platform(3, 0.5, 4, 1);
+	    plat = new Platform(1.5, 0.1, -4, 2);
+	    plat = new Platform(0.5, 1, -4, 2.5);
+	    plat = new Platform(1.5, 0.1, 4, 2);
+	    plat = new Platform(0.5, 1, 4, 2.5);
+	    plat = new Platform(3, 0.5, 0, 0);
+	    plat = new Platform(1, 0.5, 1.5, 0.5);
+	    plat = new Platform(1, 0.5, -7, 0.25);
+	    plat = new Platform(1, 0.5, 7, 0.25);
+	    plat = new Platform(1.5, 0.1, -0.5, 1);
+	    plat = new Platform(0.5, 1, 0, 1.5);
+	    roof = new Platform(16, 1, 0, 5);
+	    wall1 = new Platform(1, 25, -8, -1);
+	    wall2 = new Platform(1, 25, 8, -1);
+
+
     });
 }
 
 function userConnected() {
-    socket.on('newconnected', function(pid) {
-        console.log(pid + " CONNECTED");
-        players[pid] = new Player(pid);
+    socket.on('newconnected', function(player) {
+        drawText(player.color, "#000000", player.id,"CONNECTED", "");
+        players[player.id] = new Player(player.id, player.color);
     });
 }
 
@@ -314,48 +352,40 @@ function receiveState() {
     socket.on('moved', function(state) {
         for(var i in state) {
 	    var p = state[i];
-	    /*if(players[p.id] != null && players[p.id].pid == myPlayer.pid)	{
-	        //var j = 0;
-		for(var j = 0; j <  myPlayer.pendingInputs.length; j++) {
+	    if(players[p.id] == myPlayer) {
+
+	        myPlayer.body.position[0] = p.position.x;
+	        myPlayer.body.position[1] = p.position.y;
+		var j = 0;
+		while(j < myPlayer.pendingInputs.length) {
 		    var input = myPlayer.pendingInputs[j];
 		    if(input.seqNumber <= p.lastProcessedInput) {
-		    	console.log("SPLICING: " + j);
 		        myPlayer.pendingInputs.splice(j,1);
-			}
-		    else {
-		    	console.log("APPLYING: " + input.seqNumber);
-		        //myPlayer.applyInput(input);
-	                myPlayer.body.position[0] = p.position[0];
-	                myPlayer.body.position[1] = p.position[1];
 		    }
-		}*/
-	    if(players[p.id] != null) {
-	         players[p.id].body.position[0] = p.position.x;
-	         players[p.id].body.position[1] = p.position.y;
-	         //players[p.id].body.velocity[0] = p.velocity[0];
+		    else {
+		        myPlayer.applyInput(input);
+			j++;
+		    }
+		}
+	    }
+	    else if(players[p.id] != null) {
+	        players[p.id].applyState(p);
 	    }
 
 	    if(bombs[p.id] != null && p.bomb != null) {
-	         bombs[p.id].body.position[0] = p.bomb.x;
-	         bombs[p.id].body.position[1] = p.bomb.y;
+	        bombs[p.id].body.position[0] = p.bomb.x;
+	        bombs[p.id].body.position[1] = p.bomb.y;
 	    }
-	        
 	}
-	/*if(players[id] != null) {
-		players[id].body.velocity[0] = newData[0];
-		players[id].body.velocity[1] = newData[1];
-	}else
-	return*/
     });
 }
 
 function userDisconnected() {
     socket.on('dc', function(pid) {
-        console.log(pid + " DISCONNECTED");
         if(players[pid] != null) {
-            world.removeBody(players[pid].body);
-	    container.removeChild(players[pid].graphics);
+            drawText(players[pid].color, "#000000", pid, "DISCONNECTED","");
             players.splice(pid, 1);
+	    players[pid].destroy();
 	}
     });
 }
@@ -381,31 +411,31 @@ function onExplosion() {
 	}
 
     });
-
 }
 
 function onDestroyed() {
     socket.on('destroyed', function(data) {
-        if(players[data] != null && !players[data].isDead) {
-	    var x = players[data].body.position[0];
-	    var y = players[data].body.position[1];
+        if(players[data.id] != null && !players[data.id].isDead) {
+	    var x = players[data.id].body.position[0];
+	    var y = players[data.id].body.position[1];
 	    for(var i = 0; i < 15; i++) {
                 var randX = Math.floor((Math.random() * (2 - (-2) + 1) ) + (-2)); 
 		var vel = {x: randX, y: i/5};
 	        particles.push(new Particles(x, y, vel, 0, 10));
 	    }
-	    players[data].destroy();
+	    players[data.id].destroy();
+	    if(data.id === data.destroyerId)
+                drawText(players[data.id].color, players[data.destroyerId].color, "PLAYER", "COMMITTED SUICIDE", "");
+	    else
+                drawText(players[data.destroyerId].color, players[data.id].color, "PLAYER", "KILLED", "PLAYER");
 	 }
     });
 }
 
 function onRespawn() {
     socket.on('respawned', function(data) {
-        if(players[data] != null) {
+        if(players[data] != null && players[data].isDead) {
 	    players[data].respawn();
-            //world.removeBody(players[data].body);
-	    //container.removeChild(players[data].graphics);
-	    //console.log(data + " destroyed");
 	}
     });
 }
@@ -419,9 +449,13 @@ function updateParticles(delta) {
      }
 }
 
+
 var timeStep = 1 / 60; // seconds 
+
 function animate(t) {
     t = t || 0;
+    now = Date.now();
+
     requestAnimationFrame(animate);
 
     if(myPlayer != null)
@@ -429,12 +463,28 @@ function animate(t) {
 
     world.step(timeStep);
     updateParticles(timeStep);
+    moveText(timeStep);
+    //drawScoreBoard();
 
     for(var i in players) {
     	if(players[i] != null) {
+	    var p = players[i];
             players[i].graphics.position.x = players[i].body.position[0];
             players[i].graphics.position.y = players[i].body.position[1];
             players[i].graphics.rotation = players[i].body.angle;
+
+	    if(p.pid != myPlayer.pid) {
+	    var total = p.curState.lastUpdate - p.oldState.lastUpdate;
+	    var tickRate = 1000 / 64;
+	    var portion = (now - tickRate) - p.oldState.lastUpdate;
+	    p.lerpPercentage = portion / total;
+
+	    p.body.velocity[0] = lerp(p.oldState.vel.x, p.curState.vel.x, p.lerpPercentage);
+	    p.body.velocity[1] = lerp(p.oldState.vel.y, p.curState.vel.y, p.lerpPercentage);
+	    
+	    p.body.position[0] = lerp(p.oldState.x, p.curState.x, p.lerpPercentage);
+	    p.body.position[1] = lerp(p.oldState.y, p.curState.y, p.lerpPercentage);
+	    }
 	}
     }
 
@@ -450,7 +500,6 @@ function animate(t) {
     	if(particles[i] != null) {
             particles[i].graphics.position.x = particles[i].body.position[0];
             particles[i].graphics.position.y = particles[i].body.position[1];
-            //particles[i].graphics.rotation = particles[i].body.angle;
         }
     }
     renderer.render(stage);
@@ -468,6 +517,14 @@ function checkIfCanJump(){
         }
     }
     return result;
+}
+   // (4.22208334636).fixed(n) will return fixed point value to n places, default n = 3
+Number.prototype.fixed = function(n) { n = n || 3; return parseFloat(this.toFixed(n)); };
+
+function lerp (p, n, t) { 
+var _t = Number(t); 
+_t = (Math.max(0, Math.min(1, _t))).fixed(); 
+return (p + _t * (n - p)).fixed(); 
 }
 
 window.onkeydown = function(event){
@@ -513,3 +570,117 @@ switch(event.keyCode){
     buttons.respawn = false;
 }
 };
+
+var x = window.innerWidth/25;
+var y = window.innerHeight - window.innerHeight/4;
+
+var lastTextHeight;
+var ttl;
+
+function drawText(firstColor, thirdColor, firstText, secondText, thirdText) {
+
+    if(textLogs.length != 0)
+        lastTextHeight = textLogs[textLogs.length-1].first.position.y;
+    else
+        lastTextHeight = y;
+
+    var first;
+    var second;
+    var third;
+
+    var text = new PIXI.Text("", {font:"12px Arial", fill:"#000000"});
+    text.first = new PIXI.Text(firstText, {font:"20px Arial", fill:"#" + firstColor, stroke: "#e1e1e1", strokeThickness: 3});
+    text.second = new PIXI.Text(secondText, {font:"20px Arial", fill:"#000000", stroke:"#e1e1e1", strokeThickness: 5});
+    text.third = new PIXI.Text(thirdText, {font:"20px Arial", fill:"#" + thirdColor, stroke:"#e1e1e1", strokeThickness: 3});
+
+    text.ttl = 5;
+    var offSet = 25;
+    var posY;
+
+    text.position.x = x;
+
+    if(lastTextHeight >= y + offSet)
+        posY = y;
+    else
+        posY = lastTextHeight - offSet;
+
+    text.first.position.y = posY;
+    text.second.position.y = posY;
+    text.third.position.y = posY;
+
+    text.first.position.x = x;
+    text.second.position.x = text.first.position.x + (offSet * 15);
+    text.third.position.x = text.second.position.x + (offSet * 5);
+
+    stage.addChild(text.first);
+    stage.addChild(text.second);
+    stage.addChild(text.third);
+    textLogs.push(text);
+}
+
+function moveText(delta) {
+
+    var scrollSpeed = 35;
+    for(var i in textLogs) {
+        var t = textLogs[i];
+	if(t.ttl <= 0) {
+	    stage.removeChild(t.first); 
+	    stage.removeChild(t.second); 
+	    stage.removeChild(t.third); 
+	    t.first.destroy();
+	    t.second.destroy();
+	    t.third.destroy();
+	    textLogs.splice(i, 1);
+	}else 
+	    t.ttl -= delta;
+
+	t.first.position.y += delta * scrollSpeed;
+	t.second.position.y += delta * scrollSpeed;
+	t.third.position.y += delta * scrollSpeed;
+    }
+}
+
+function drawScoreBoard() {
+    var k;
+    var d;
+    var p;
+
+    var posX = window.innerWidth - window.innerWidth/5;
+    var posY = window.innerHeight - window.innerHeight/2.5;
+
+    var textOffSet = 35;
+    var lastY = posY;
+
+
+    for(var i in players) {
+	p = players[i];
+        k = p.kills;
+        d = p.deaths;
+
+        var player = new PIXI.Text("P" , {font:"16px Arial", fill: "#000000"});
+        var kills = new PIXI.Text("" , {font:"15px Arial", fill:"#FFFFFF"});
+        var deaths = new PIXI.Text("" , {font:"15px Arial", fill:"#000000"});
+
+	player.setStyle({fill:"#" + p.color, stroke: "#e1e1e1", strokeThickness: 1});
+	kills.setStyle({fill:"#000000", stroke: "#e1e1e1", strokeThickness: 2});
+	deaths.setStyle({fill:"#000000", stroke: "#e1e1e1", strokeThickness: 2});
+
+	kills.setText(k);
+	deaths.setText(d);
+
+	player.position.x = posX;
+        player.position.y = lastY + textOffSet;
+
+        kills.position.x = posX + textOffSet;
+        kills.position.y = lastY + textOffSet;
+
+        deaths.position.x = kills.position.x + textOffSet;
+        deaths.position.y = lastY + textOffSet;
+	
+	lastY = kills.position.y;
+
+        stage.addChild(player);
+        stage.addChild(kills);
+        stage.addChild(deaths);
+    }
+}
